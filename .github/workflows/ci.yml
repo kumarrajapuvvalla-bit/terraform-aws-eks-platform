@@ -1,0 +1,223 @@
+# ---------------------------------------------------------------------------
+# CI Pipeline — runs on every Pull Request targeting the main branch.
+#
+# Jobs:
+#   1. terraform-fmt       — fails if any .tf file is not properly formatted
+#   2. terraform-validate  — validates syntax and module references
+#   3. tfsec               — static security analysis (Aqua Security tfsec)
+#   4. pr-comment          — posts a summary comment on the PR
+# ---------------------------------------------------------------------------
+
+name: "Terraform CI"
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "**.tf"
+      - "**.tfvars"
+      - ".github/workflows/ci.yml"
+
+# Cancel any in-progress run for the same PR
+concurrency:
+  group: ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write   # needed to post PR comments
+
+env:
+  TF_VERSION: "1.7.5"
+  TF_WORKING_DIR: "."
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Job 1: Terraform Format Check
+  # -------------------------------------------------------------------------
+  terraform-fmt:
+    name: "Terraform Format"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Format Check
+        id: fmt
+        run: terraform fmt -check -recursive
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        continue-on-error: true
+
+      - name: Comment on PR (fmt failure)
+        if: steps.fmt.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## :x: Terraform Format Failed\n\nRun \`terraform fmt -recursive\` locally to fix formatting issues.`
+            })
+
+      - name: Fail if fmt check failed
+        if: steps.fmt.outcome == 'failure'
+        run: exit 1
+
+  # -------------------------------------------------------------------------
+  # Job 2: Terraform Validate
+  # -------------------------------------------------------------------------
+  terraform-validate:
+    name: "Terraform Validate"
+    runs-on: ubuntu-latest
+    needs: terraform-fmt
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init (no backend)
+        id: init
+        run: terraform init -backend=false
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate -no-color
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        continue-on-error: true
+
+      - name: Comment on PR (validate result)
+        uses: actions/github-script@v7
+        if: always()
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const outcome = "${{ steps.validate.outcome }}"
+            const icon = outcome === "success" ? ":white_check_mark:" : ":x:"
+            const body = `## ${icon} Terraform Validate\n\n` +
+              `**Outcome:** ${outcome}\n\n` +
+              `**Output:**\n\`\`\`\n${{ steps.validate.outputs.stdout }}\n\`\`\``
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            })
+
+      - name: Fail if validate failed
+        if: steps.validate.outcome == 'failure'
+        run: exit 1
+
+  # -------------------------------------------------------------------------
+  # Job 3: tfsec Security Scan
+  # -------------------------------------------------------------------------
+  tfsec:
+    name: "tfsec Security Scan"
+    runs-on: ubuntu-latest
+    needs: terraform-fmt
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run tfsec
+        id: tfsec
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          working_directory: ${{ env.TF_WORKING_DIR }}
+          version: latest
+          format: lovely
+          additional_args: >-
+            --no-colour
+            --minimum-severity MEDIUM
+            --exclude-downloaded-modules
+        continue-on-error: true
+
+      - name: tfsec SARIF upload
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: results.sarif
+        continue-on-error: true
+
+      - name: Read tfsec output
+        id: tfsec_output
+        if: always()
+        run: |
+          if [ -f tfsec-output.txt ]; then
+            echo "output=$(cat tfsec-output.txt | head -c 3000)" >> $GITHUB_OUTPUT
+          else
+            echo "output=tfsec ran but no output file found" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Comment on PR (tfsec result)
+        uses: actions/github-script@v7
+        if: always()
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const outcome = "${{ steps.tfsec.outcome }}"
+            const icon = outcome === "success" ? ":white_check_mark:" : ":warning:"
+            const body = `## ${icon} tfsec Security Scan\n\n` +
+              `**Outcome:** ${outcome}\n\n` +
+              `> Checks for: public S3 buckets, open SGs, missing EKS logging, unencrypted secrets, missing IMDSv2\n\n` +
+              `To run locally: \`tfsec . --minimum-severity MEDIUM\``
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            })
+
+      - name: Fail if tfsec found critical issues
+        if: steps.tfsec.outcome == 'failure'
+        run: |
+          echo "tfsec found security issues. Review the PR comment and fix before merging."
+          exit 1
+
+  # -------------------------------------------------------------------------
+  # Job 4: CI Summary
+  # -------------------------------------------------------------------------
+  ci-summary:
+    name: "CI Summary"
+    runs-on: ubuntu-latest
+    needs: [terraform-fmt, terraform-validate, tfsec]
+    if: always()
+    steps:
+      - name: Post CI summary comment
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fmt      = "${{ needs.terraform-fmt.result }}"
+            const validate = "${{ needs.terraform-validate.result }}"
+            const security = "${{ needs.tfsec.result }}"
+            const icon = (r) => r === "success" ? ":white_check_mark:" : r === "skipped" ? ":fast_forward:" : ":x:"
+            const body = [
+              "## :robot: Terraform CI Summary",
+              "",
+              "| Check | Status |",
+              "|-------|--------|",
+              `| Terraform Format | ${icon(fmt)} ${fmt} |`,
+              `| Terraform Validate | ${icon(validate)} ${validate} |`,
+              `| tfsec Security Scan | ${icon(security)} ${security} |`,
+              "",
+              `Run ID: [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})`
+            ].join("\n")
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            })
